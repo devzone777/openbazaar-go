@@ -30,6 +30,46 @@ import (
 
 var Log = logging.MustGetLogger("client")
 
+// RWMutex wraps a sync.RWMutex and adds logging around its actions
+type RWMutex struct {
+	name string
+	sync.RWMutex
+}
+
+// NewRWMutex creates a new `RWMutex` whose actions with be logged and labeled
+// with the given name
+func NewRWMutex(name string) RWMutex {
+	return RWMutex{name, sync.RWMutex{}}
+}
+
+// Lock intercepts calls to lock this mutex and wraps logging around it
+func (m *RWMutex) Lock() {
+	Log.Info("Locking mutex:", m.name)
+	m.RWMutex.Lock()
+	Log.Info("Locked mutex:", m.name)
+}
+
+// Unlock intercepts calls to unlock this mutex and wraps logging around it
+func (m *RWMutex) Unlock() {
+	Log.Info("Unlocking mutex:", m.name)
+	m.RWMutex.Unlock()
+	Log.Info("Unlocked mutex:", m.name)
+}
+
+// RLock intercepts calls to rlock this mutex and wraps logging around it
+func (m *RWMutex) RLock() {
+	Log.Info("RLocking mutex:", m.name)
+	m.RWMutex.RLock()
+	Log.Info("RLocked mutex:", m.name)
+}
+
+// RUnlock intercepts calls to runlock this mutex and wraps logging around it
+func (m *RWMutex) RUnlock() {
+	Log.Info("RUnlocking mutex:", m.name)
+	m.RWMutex.RUnlock()
+	Log.Info("RUnlocked mutex:", m.name)
+}
+
 type wsWatchdog struct {
 	client    *BlockBookClient
 	done      chan struct{}
@@ -108,7 +148,7 @@ type BlockBookClient struct {
 	HTTPClient   http.Client
 	RequestFunc  func(endpoint, method string, body []byte, query url.Values) (*http.Response, error)
 	SocketClient model.SocketClient
-	socketMutex  sync.RWMutex
+	socketMutex  RWMutex
 }
 
 func NewBlockBookClient(apiUrl string, proxyDialer proxy.Dialer) (*BlockBookClient, error) {
@@ -215,7 +255,11 @@ func (i *BlockBookClient) doRequest(endpoint, method string, body []byte, query 
 	}
 	req.Header.Add("Content-Type", "application/json")
 
+	Log.Infof("Retrieving: %s", req.URL.String())
+
+	time.Sleep(time.Millisecond*10)
 	resp, err := i.HTTPClient.Do(req)
+
 	if err != nil {
 		if urlErr, ok := err.(*url.Error); ok && urlErr.Timeout() {
 			Log.Errorf("timed out executing: %s", err.Error())
@@ -506,27 +550,18 @@ func (i *BlockBookClient) TransactionNotify() <-chan model.Transaction {
 	return i.txNotifyChan
 }
 
-func (i *BlockBookClient) ListenAddresses(addrs ...btcutil.Address) {
-	if len(addrs) == 0 {
-		return
-	}
-
+func (i *BlockBookClient) ListenAddress(addr btcutil.Address) {
 	i.listenLock.Lock()
 	defer i.listenLock.Unlock()
+	var args []interface{}
+	args = append(args, "bitcoind/addresstxid")
+	args = append(args, []string{maybeConvertCashAddress(addr)})
 	i.socketMutex.RLock()
 	defer i.socketMutex.RUnlock()
-
-	var convertedAddrs []string
-	for _, addr := range addrs {
-		convertedAddrs = append(convertedAddrs, maybeConvertCashAddress(addr))
-	}
-
 	if i.SocketClient != nil {
-		var args = []string{"bitcoind/addresstxid"}
-		args = append(args, convertedAddrs...)
-		i.SocketClient.Emit("subscribe", protocol.ToArgArray(args))
+		i.SocketClient.Emit("subscribe", args)
 	} else {
-		i.listenQueue = append(i.listenQueue, convertedAddrs...)
+		i.listenQueue = append(i.listenQueue, maybeConvertCashAddress(addr))
 	}
 }
 
@@ -556,12 +591,12 @@ func connectSocket(u *url.URL, proxyDialer proxy.Dialer) (model.SocketClient, er
 }
 
 func (i *BlockBookClient) setupListeners() error {
-	i.listenLock.Lock()
-	defer i.listenLock.Unlock()
-
 	if i.SocketClient != nil {
 		return nil
 	}
+
+	i.listenLock.Lock()
+	defer i.listenLock.Unlock()
 
 	client, err := connectSocket(i.apiUrl, i.proxyDialer)
 	if err != nil {
@@ -629,15 +664,13 @@ func (i *BlockBookClient) setupListeners() error {
 			}
 		}
 	})
-
-	// Subscribe to queued addresses
-	if len(i.listenQueue) != 0 {
-		var args = []string{"bitcoind/addresstxid"}
-		args = append(args, i.listenQueue...)
-		i.SocketClient.Emit("subscribe", protocol.ToArgArray(args))
-		i.listenQueue = []string{}
+	for _, addr := range i.listenQueue {
+		var args []interface{}
+		args = append(args, "bitcoind/addresstxid")
+		args = append(args, []string{addr})
+		i.SocketClient.Emit("subscribe", args)
 	}
-
+	i.listenQueue = []string{}
 	Log.Infof("websocket connected (%s)", i.String())
 	return nil
 }
