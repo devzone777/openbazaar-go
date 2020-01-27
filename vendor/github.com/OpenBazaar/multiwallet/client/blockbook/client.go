@@ -28,6 +28,8 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+const maxInfightQueries = 25
+
 var Log = logging.MustGetLogger("client")
 
 // RWMutex wraps a sync.RWMutex and adds logging around its actions
@@ -385,20 +387,28 @@ func (i *BlockBookClient) GetRawTransaction(txid string) ([]byte, error) {
 	return nil, nil
 }
 
+// GetTransactions returns the transactions for a given address. If a single address
+// query fails this method will not return an error. Instead it will log the error
+// and returns the transactions for the other addresses.
 func (i *BlockBookClient) GetTransactions(addrs []btcutil.Address) ([]model.Transaction, error) {
 	var txs []model.Transaction
 	type txsOrError struct {
 		Txs []model.Transaction
 		Err error
 	}
-	txChan := make(chan txsOrError)
+	var (
+		txChan    = make(chan txsOrError)
+		queryChan = make(chan struct{}, maxInfightQueries)
+		wg        sync.WaitGroup
+	)
+	wg.Add(len(addrs))
 	go func() {
-		var wg sync.WaitGroup
-		wg.Add(len(addrs))
 		for _, addr := range addrs {
+			queryChan <- struct{}{}
 			go func(a btcutil.Address) {
 				txs, err := i.getTransactions(maybeConvertCashAddress(a))
 				txChan <- txsOrError{txs, err}
+				<-queryChan
 				wg.Done()
 			}(addr)
 		}
@@ -407,6 +417,7 @@ func (i *BlockBookClient) GetTransactions(addrs []btcutil.Address) ([]model.Tran
 	}()
 	for toe := range txChan {
 		if toe.Err != nil {
+			Log.Errorf("Error querying address from blockbook: %s", toe.Err.Error())
 			return nil, toe.Err
 		}
 		txs = append(txs, toe.Txs...)
@@ -470,19 +481,29 @@ func (i *BlockBookClient) getTransactions(addr string) ([]model.Transaction, err
 	return ret, nil
 }
 
+// GetUtxos returns the utxos for a given address. If a single address
+// query fails this method will not return an error. Instead it will log the error
+// and returns the transactions for the other addresses.
 func (i *BlockBookClient) GetUtxos(addrs []btcutil.Address) ([]model.Utxo, error) {
 	var ret []model.Utxo
 	type utxoOrError struct {
 		Utxo *model.Utxo
 		Err  error
 	}
-	utxoChan := make(chan utxoOrError)
-	var wg sync.WaitGroup
+	var (
+		wg        sync.WaitGroup
+		queryChan = make(chan struct{}, maxInfightQueries)
+		utxoChan  = make(chan utxoOrError)
+	)
 	wg.Add(len(addrs))
 	go func() {
 		for _, addr := range addrs {
+			queryChan <- struct{}{}
 			go func(addr btcutil.Address) {
 				defer wg.Done()
+				defer func() {
+					<-queryChan
+				}()
 				resp, err := i.RequestFunc("/utxo/"+maybeConvertCashAddress(addr), http.MethodGet, nil, nil)
 				if err != nil {
 					utxoChan <- utxoOrError{nil, err}
@@ -533,6 +554,7 @@ func (i *BlockBookClient) GetUtxos(addrs []btcutil.Address) ([]model.Utxo, error
 	}()
 	for toe := range utxoChan {
 		if toe.Err != nil {
+			Log.Errorf("Error querying utxos from blockbook: %s", toe.Err.Error())
 			return nil, toe.Err
 		}
 		if toe.Utxo != nil {
@@ -559,7 +581,7 @@ func (i *BlockBookClient) ListenAddress(addr btcutil.Address) {
 	i.socketMutex.RLock()
 	defer i.socketMutex.RUnlock()
 	if i.SocketClient != nil {
-		i.SocketClient.Emit("subscribe", args)
+		i.SocketClient.Emit("subscribe", []interface{}{"bitcoind/addresstxid", convertedAddrs})
 	} else {
 		i.listenQueue = append(i.listenQueue, maybeConvertCashAddress(addr))
 	}
@@ -664,11 +686,11 @@ func (i *BlockBookClient) setupListeners() error {
 			}
 		}
 	})
-	for _, addr := range i.listenQueue {
-		var args []interface{}
-		args = append(args, "bitcoind/addresstxid")
-		args = append(args, []string{addr})
-		i.SocketClient.Emit("subscribe", args)
+
+	// Subscribe to queued addresses
+	if len(i.listenQueue) != 0 {
+		i.SocketClient.Emit("subscribe", []interface{}{"bitcoind/addresstxid", i.listenQueue})
+		i.listenQueue = []string{}
 	}
 	i.listenQueue = []string{}
 	Log.Infof("websocket connected (%s)", i.String())
